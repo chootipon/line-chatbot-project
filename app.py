@@ -97,11 +97,6 @@ def get_product_data(action, query_params=None):
         print(f"Firestore data retrieval error: {e}")
         return f"เกิดข้อผิดพลาดในการดึงข้อมูลจาก Firebase: {e}"
 
----
-
-## LINE OA Webhook & Chatbot Logic
-
-```python
 # --- Webhook Endpoint สำหรับ LINE OA ---
 @app.route("/callback", methods=['POST'])
 def callback():
@@ -204,3 +199,81 @@ def handle_message(event):
         event.reply_token,
         TextSendMessage(text=reply_message)
     )
+
+# --- Route สำหรับหน้า Admin Dashboard (ใช้ Firestore) ---
+@app.route("/admin")
+def admin_dashboard():
+    products_ref = db.collection('products')
+    products = []
+    for doc in products_ref.stream():
+        # ดึง id จาก doc.id และรวมเข้ากับ dict ของข้อมูล
+        product_data = doc.to_dict()
+        product_data['id'] = doc.id 
+        products.append(product_data)
+    return render_template("admin.html", products=products)
+
+# --- Route สำหรับเพิ่มสินค้า (ใช้ Firestore) ---
+@app.route("/admin/add_product", methods=['GET', 'POST'])
+def add_product():
+    if request.method == 'POST':
+        product_data = {
+            'name': request.form['name'],
+            'price': float(request.form['price']),
+            'stock': int(request.form['stock']),
+            'category': request.form['category']
+        }
+        try:
+            # ให้ Firestore สร้าง ID ให้โดยอัตโนมัติ และบันทึกข้อมูล
+            doc_ref = db.collection('products').document()
+            doc_ref.set(product_data)
+            flash(f"สินค้าถูกเพิ่มเรียบร้อยแล้ว! (ID: {doc_ref.id})", "success")
+        except Exception as e:
+            flash(f"เกิดข้อผิดพลาดในการเพิ่มสินค้า: {e}", "danger")
+        return redirect(url_for('admin_dashboard'))
+    return render_template("add_product.html")
+
+# --- Route สำหรับแก้ไขสินค้า (ใช้ Firestore) ---
+@app.route("/admin/edit_product/<string:product_id>", methods=['GET', 'POST'])
+def edit_product(product_id):
+    doc_ref = db.collection('products').document(product_id)
+    product_doc = doc_ref.get()
+
+    if not product_doc.exists:
+        flash("ไม่พบสินค้าที่ต้องการแก้ไข", "danger")
+        return redirect(url_for('admin_dashboard'))
+
+    # แปลง DocumentSnapshot เป็น dict และเพิ่ม 'id' เข้าไป
+    product = product_doc.to_dict()
+    product['id'] = product_doc.id 
+
+    if request.method == 'POST':
+        updated_data = {
+            'name': request.form['name'],
+            'price': float(request.form['price']),
+            'stock': int(request.form['stock']),
+            'category': request.form['category']
+        }
+        try:
+            # อัปเดตข้อมูลใน Firestore, merge=True จะอัปเดตเฉพาะ field ที่มี
+            doc_ref.set(updated_data, merge=True) 
+            flash("สินค้าถูกแก้ไขเรียบร้อยแล้ว!", "success")
+        except Exception as e:
+            flash(f"เกิดข้อผิดพลาดในการแก้ไขสินค้า: {e}", "danger")
+        return redirect(url_for('admin_dashboard'))
+    
+    return render_template("edit_product.html", product=product)
+
+# --- Route สำหรับลบสินค้า (ใช้ Firestore) ---
+@app.route("/admin/delete_product/<string:product_id>", methods=['POST'])
+def delete_product(product_id):
+    try:
+        db.collection('products').document(product_id).delete()
+        flash("สินค้าถูกลบเรียบร้อยแล้ว!", "success")
+    except Exception as e:
+        flash(f"เกิดข้อผิดพลาดในการลบสินค้า: {e}", "danger")
+    return redirect(url_for('admin_dashboard'))
+
+# --- รัน Flask App ---
+if __name__ == "__main__":
+    port = int(os.environ.get('PORT', 10000)) # Render จะกำหนด PORT ให้
+    app.run(host='0.0.0.0', port=port) # รันบน 0.0.0.0 เพื่อให้เข้าถึงได้จากภายนอก
