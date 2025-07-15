@@ -4,11 +4,12 @@ from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
 from linebot.models import MessageEvent, TextMessage, TextSendMessage
 import google.generativeai as genai
+import json # สำหรับโหลด Service Account Key
+import time # สำหรับจับเวลา
 
 # --- Firebase Imports ---
 import firebase_admin
 from firebase_admin import credentials, firestore
-import json # สำหรับโหลด Service Account Key
 
 # --- กำหนดค่า Config (ต้องเปลี่ยนเป็นค่าของคุณเอง) ---
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
@@ -65,36 +66,42 @@ def get_product_data(action, query_params=None):
     products_ref = db.collection('products')
     result_docs = []
 
+    print(f"DEBUG: get_product_data called with action='{action}' and query_params='{query_params}'")
     try:
         if action == "fetch_all_products":
             docs = products_ref.stream()
             for doc in docs:
                 result_docs.append(doc.to_dict())
+            print(f"DEBUG: Fetched {len(result_docs)} documents for fetch_all_products.")
             return result_docs
         
         elif action == "fetch_by_name" and query_params and 'name' in query_params:
             product_name = query_params['name']
-            # ค้นหาแบบตรงตัว (Firestore ไม่มี LIKE query โดยตรง)
+            print(f"DEBUG: Fetching by name: {product_name}")
             docs = products_ref.where('name', '==', product_name).stream()
             for doc in docs:
                 result_docs.append(doc.to_dict())
+            print(f"DEBUG: Fetched {len(result_docs)} documents for name '{product_name}'.")
             return result_docs
         
         elif action == "fetch_by_category" and query_params and 'category' in query_params:
             category_name = query_params['category']
+            print(f"DEBUG: Fetching by category: {category_name}")
             docs = products_ref.where('category', '==', category_name).stream()
             for doc in docs:
                 result_docs.append(doc.to_dict())
+            print(f"DEBUG: Fetched {len(result_docs)} documents for category '{category_name}'.")
             return result_docs
         
         # คุณสามารถเพิ่ม action อื่นๆ ได้ที่นี่ เช่น:
         # - "fetch_low_stock": ดึงสินค้าที่สต็อกเหลือน้อย
         # - "fetch_expensive_items": ดึงสินค้าที่มีราคาสูง
         
+        print(f"DEBUG: Action '{action}' not recognized or missing query_params.")
         return None # ถ้าไม่ตรงกับ action ที่รู้จัก
     
     except Exception as e:
-        print(f"Firestore data retrieval error: {e}")
+        print(f"ERROR: Firestore data retrieval error: {e}")
         return f"เกิดข้อผิดพลาดในการดึงข้อมูลจาก Firebase: {e}"
 
 # --- Webhook Endpoint สำหรับ LINE OA ---
@@ -102,7 +109,7 @@ def get_product_data(action, query_params=None):
 def callback():
     signature = request.headers['X-Line-Signature']
     body = request.get_data(as_text=True)
-    app.logger.info("Request body: " + body)
+    app.logger.info("Request body: " + body) # ใช้ app.logger.info แทน print สำหรับ request body
 
     try:
         handler.handle(body, signature)
@@ -117,9 +124,13 @@ def handle_message(event):
     user_message = event.message.text
     reply_message = "ขออภัยค่ะ ไม่เข้าใจคำถามของคุณ ลองถามใหม่นะคะ"
 
+    print(f"\n--- New Message from LINE ---")
+    print(f"DEBUG: User message received: '{user_message}'")
+    start_total_time = time.time()
+
     try:
         # --- ขั้นตอนที่ 1: ให้ Gemini ระบุ "เจตนา" และข้อมูลที่ต้องการจากคำถามผู้ใช้ ---
-        # เราจะใช้ JSON เพื่อให้ Gemini ตอบกลับมาในรูปแบบที่มีโครงสร้างชัดเจน
+        start_gemini_intent_time = time.time()
         intent_prompt = f"""
         คุณคือผู้ช่วย AI ที่เชี่ยวชาญในการทำความเข้าใจคำถามและระบุข้อมูลที่จำเป็นจากฐานข้อมูลสินค้า.
         ฐานข้อมูลของเรามี Collection 'products' ที่มีโครงสร้างดังนี้:
@@ -149,26 +160,34 @@ def handle_message(event):
         
         intent_response = model.generate_content(intent_prompt)
         intent_json_str = intent_response.text.strip()
-        print(f"Gemini Intent JSON: {intent_json_str}")
+        print(f"DEBUG: Time for Intent generation: {time.time() - start_gemini_intent_time:.2f} seconds")
+        print(f"DEBUG: Gemini Intent JSON: {intent_json_str}")
 
+        action = "unknown"
+        query_params = None
         try:
             intent_data = json.loads(intent_json_str)
             action = intent_data.get('action')
             query_params = intent_data.get('query_params')
+            print(f"DEBUG: Parsed action: '{action}', params: '{query_params}'")
         except json.JSONDecodeError:
-            print(f"Failed to parse JSON from Gemini: {intent_json_str}")
-            action = "unknown"
-            query_params = None
+            print(f"ERROR: Failed to parse JSON from Gemini: {intent_json_str}")
+            # action ยังคงเป็น "unknown" ตามค่าเริ่มต้น
 
         retrieved_data = None
         if action != "unknown":
             retrieved_data = get_product_data(action, query_params)
             if isinstance(retrieved_data, str): # ถ้ามี error จาก Firestore
                 reply_message = retrieved_data
+                print(f"ERROR: Firestore data retrieval failed: {reply_message}")
                 line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_message))
                 return # จบการทำงานตรงนี้ถ้ามี error ในการดึงข้อมูล
+            print(f"DEBUG: Retrieved data from Firestore: {json.dumps(retrieved_data, ensure_ascii=False)}")
+        else:
+            print(f"DEBUG: Action is 'unknown', skipping data retrieval.")
 
         # --- ขั้นตอนที่ 2: ให้ Gemini สังเคราะห์คำตอบจากข้อมูลที่ดึงมา ---
+        start_gemini_answer_time = time.time()
         answer_prompt = f"""
         ผู้ใช้ถามคำถาม: "{user_message}"
 
@@ -190,26 +209,38 @@ def handle_message(event):
         
         final_answer_response = model.generate_content(answer_prompt)
         reply_message = final_answer_response.text.strip()
+        print(f"DEBUG: Time for Answer generation: {time.time() - start_gemini_answer_time:.2f} seconds")
+        print(f"DEBUG: Final reply message to LINE: '{reply_message}'")
+
+        if not reply_message: # ถ้าข้อความเป็นค่าว่าง
+            reply_message = "ขออภัยค่ะ ไม่สามารถสร้างคำตอบได้ในขณะนี้ โปรดลองอีกครั้ง."
+            print("DEBUG: Reply message was empty, setting fallback.")
 
     except Exception as e:
-        print(f"Error processing message: {e}")
+        print(f"FATAL ERROR: Unhandled exception in handle_message: {e}")
         reply_message = "เกิดข้อผิดพลาดในการประมวลผล กรุณาลองใหม่อีกครั้งค่ะ"
 
     line_bot_api.reply_message(
         event.reply_token,
         TextSendMessage(text=reply_message)
     )
+    print(f"--- End of Message Handling (Total Time: {time.time() - start_total_time:.2f} seconds) ---")
+
 
 # --- Route สำหรับหน้า Admin Dashboard (ใช้ Firestore) ---
 @app.route("/admin")
 def admin_dashboard():
     products_ref = db.collection('products')
     products = []
-    for doc in products_ref.stream():
-        # ดึง id จาก doc.id และรวมเข้ากับ dict ของข้อมูล
-        product_data = doc.to_dict()
-        product_data['id'] = doc.id 
-        products.append(product_data)
+    try:
+        for doc in products_ref.stream():
+            product_data = doc.to_dict()
+            product_data['id'] = doc.id 
+            products.append(product_data)
+        print(f"DEBUG: Loaded {len(products)} products for admin dashboard.")
+    except Exception as e:
+        print(f"ERROR: Failed to load products for admin dashboard: {e}")
+        flash(f"เกิดข้อผิดพลาดในการโหลดสินค้า: {e}", "danger")
     return render_template("admin.html", products=products)
 
 # --- Route สำหรับเพิ่มสินค้า (ใช้ Firestore) ---
@@ -223,12 +254,13 @@ def add_product():
             'category': request.form['category']
         }
         try:
-            # ให้ Firestore สร้าง ID ให้โดยอัตโนมัติ และบันทึกข้อมูล
             doc_ref = db.collection('products').document()
             doc_ref.set(product_data)
             flash(f"สินค้าถูกเพิ่มเรียบร้อยแล้ว! (ID: {doc_ref.id})", "success")
+            print(f"DEBUG: Added product: {product_data['name']} with ID: {doc_ref.id}")
         except Exception as e:
             flash(f"เกิดข้อผิดพลาดในการเพิ่มสินค้า: {e}", "danger")
+            print(f"ERROR: Failed to add product: {e}")
         return redirect(url_for('admin_dashboard'))
     return render_template("add_product.html")
 
@@ -240,9 +272,9 @@ def edit_product(product_id):
 
     if not product_doc.exists:
         flash("ไม่พบสินค้าที่ต้องการแก้ไข", "danger")
+        print(f"DEBUG: Product ID '{product_id}' not found for editing.")
         return redirect(url_for('admin_dashboard'))
 
-    # แปลง DocumentSnapshot เป็น dict และเพิ่ม 'id' เข้าไป
     product = product_doc.to_dict()
     product['id'] = product_doc.id 
 
@@ -254,11 +286,12 @@ def edit_product(product_id):
             'category': request.form['category']
         }
         try:
-            # อัปเดตข้อมูลใน Firestore, merge=True จะอัปเดตเฉพาะ field ที่มี
             doc_ref.set(updated_data, merge=True) 
             flash("สินค้าถูกแก้ไขเรียบร้อยแล้ว!", "success")
+            print(f"DEBUG: Updated product ID: {product_id} with data: {updated_data}")
         except Exception as e:
             flash(f"เกิดข้อผิดพลาดในการแก้ไขสินค้า: {e}", "danger")
+            print(f"ERROR: Failed to update product ID: {product_id} - {e}")
         return redirect(url_for('admin_dashboard'))
     
     return render_template("edit_product.html", product=product)
@@ -269,8 +302,10 @@ def delete_product(product_id):
     try:
         db.collection('products').document(product_id).delete()
         flash("สินค้าถูกลบเรียบร้อยแล้ว!", "success")
+        print(f"DEBUG: Deleted product ID: {product_id}")
     except Exception as e:
         flash(f"เกิดข้อผิดพลาดในการลบสินค้า: {e}", "danger")
+        print(f"ERROR: Failed to delete product ID: {product_id} - {e}")
     return redirect(url_for('admin_dashboard'))
 
 # --- รัน Flask App ---
