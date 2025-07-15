@@ -45,7 +45,7 @@ except Exception as e:
 
 # กำหนดค่า Gemini Model
 genai.configure(api_key=GOOGLE_GEMINI_API_KEY)
-model = genai.GenerativeModel('gemini-pro') # สามารถใช้ 'gemini-1.5-pro' หากคุณเข้าถึงได้และต้องการความสามารถที่สูงขึ้น
+model = genai.GenerativeModel('gemini-flash') # สามารถใช้ 'gemini-1.5-pro' หากคุณเข้าถึงได้และต้องการความสามารถที่สูงขึ้น
 
 app = Flask(__name__)
 app.secret_key = FLASK_SECRET_KEY # ตั้งค่า Secret Key สำหรับ Flask Flash Messages
