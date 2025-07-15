@@ -3,15 +3,18 @@ from flask import Flask, request, abort, render_template, redirect, url_for, fla
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
 from linebot.models import MessageEvent, TextMessage, TextSendMessage
-import google.generativeai as genai
-import json # สำหรับโหลด Service Account Key
-import time # สำหรับจับเวลา
-import logging # สำหรับ Logging ที่ดีขึ้นใน Flask
+import json
+import time
+import logging
+
+# --- OpenAI Import ---
+import openai
+from openai import OpenAI # ใช้สำหรับ OpenAI Python SDK v1.x.x ขึ้นไป
 
 # ตั้งค่า Logging ให้เห็น DEBUG message ใน Render logs
-logging.basicConfig(level=logging.INFO) # เริ่มต้นเป็น INFO
-app_logger = logging.getLogger('app_logger') # สร้าง logger ของตัวเอง
-app_logger.setLevel(logging.DEBUG) # ตั้งระดับเป็น DEBUG สำหรับ logger นี้
+logging.basicConfig(level=logging.INFO)
+app_logger = logging.getLogger('app_logger')
+app_logger.setLevel(logging.DEBUG)
 
 # --- Firebase Imports ---
 import firebase_admin
@@ -20,41 +23,42 @@ from firebase_admin import credentials, firestore
 # --- กำหนดค่า Config (ต้องเปลี่ยนเป็นค่าของคุณเอง) ---
 LINE_CHANNEL_ACCESS_TOKEN = os.getenv("LINE_CHANNEL_ACCESS_TOKEN")
 LINE_CHANNEL_SECRET = os.getenv("LINE_CHANNEL_SECRET")
-GOOGLE_GEMINI_API_KEY = os.getenv("GOOGLE_GEMINI_API_KEY")
+# เปลี่ยนจาก GOOGLE_GEMINI_API_KEY เป็น OPENAI_API_KEY
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") 
 FIREBASE_SERVICE_ACCOUNT_JSON = os.getenv("FIREBASE_SERVICE_ACCOUNT_JSON")
-FLASK_SECRET_KEY = os.getenv("FLASK_SECRET_KEY", "your_super_secret_key_for_flask_messages") # ควรเปลี่ยนเป็นคีย์ที่ซับซ้อนกว่านี้
+FLASK_SECRET_KEY = os.getenv("FLASK_SECRET_KEY", "your_super_secret_key_for_flask_messages")
 
 # ตรวจสอบว่าได้ตั้งค่า Environment Variables แล้ว
 if not LINE_CHANNEL_ACCESS_TOKEN: raise ValueError("LINE_CHANNEL_ACCESS_TOKEN is not set.")
 if not LINE_CHANNEL_SECRET: raise ValueError("LINE_CHANNEL_SECRET is not set.")
-if not GOOGLE_GEMINI_API_KEY: raise ValueError("GOOGLE_GEMINI_API_KEY is not set.")
+if not OPENAI_API_KEY: raise ValueError("OPENAI_API_KEY is not set.") # ตรวจสอบ OpenAI Key
 if not FIREBASE_SERVICE_ACCOUNT_JSON: raise ValueError("FIREBASE_SERVICE_ACCOUNT_JSON is not set.")
 
 # --- ตั้งค่า Firebase ---
 try:
-    # โหลด Service Account Key จาก string JSON ที่อยู่ใน Environment Variable
     cred_json = json.loads(FIREBASE_SERVICE_ACCOUNT_JSON)
     cred = credentials.Certificate(cred_json)
     firebase_admin.initialize_app(cred)
-    db = firestore.client() # ได้ Instance ของ Firestore
+    db = firestore.client()
     app_logger.info("Firebase initialized successfully!")
 except Exception as e:
     app_logger.error(f"Error initializing Firebase: {e}")
-    # ใน Production อาจจะใช้ Sentry/Cloud Logging เพื่อจับ error นี้และทำให้ App หยุดทำงาน
     exit(1)
 
-# กำหนดค่า Gemini Model
-genai.configure(api_key=GOOGLE_GEMINI_API_KEY)
-model = genai.GenerativeModel('gemini-flash') # สามารถใช้ 'gemini-1.5-pro' หากคุณเข้าถึงได้และต้องการความสามารถที่สูงขึ้น
+# --- ตั้งค่า OpenAI Client ---
+# ใช้ OpenAI() สำหรับ SDK v1.x.x ขึ้นไป
+client = OpenAI(api_key=OPENAI_API_KEY) 
+# ถ้าคุณใช้ SDK เวอร์ชันเก่า (0.28.1 หรือต่ำกว่า) จะเป็น openai.api_key = OPENAI_API_KEY
+# และเรียกใช้ openai.ChatCompletion.create
 
 app = Flask(__name__)
-app.secret_key = FLASK_SECRET_KEY # ตั้งค่า Secret Key สำหรับ Flask Flash Messages
+app.secret_key = FLASK_SECRET_KEY
 
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 
-# --- ข้อมูล Schema สำหรับ Gemini (อธิบายโครงสร้าง Firestore) ---
-# สิ่งนี้ช่วยให้ Gemini เข้าใจ "ประเภท" ของข้อมูลที่เรามีใน Firestore
+# --- ข้อมูล Schema สำหรับ AI (อธิบายโครงสร้าง Firestore) ---
+# นี่คือคำอธิบายที่จะส่งให้ GPT-3.5 Turbo เพื่อให้มันเข้าใจโครงสร้างข้อมูล
 FIRESTORE_SCHEMA_DESCRIPTION = """
 เรามีข้อมูลสินค้าใน Firebase Firestore ใน Collection ชื่อ 'products'
 แต่ละเอกสาร (document) ใน Collection 'products' มี fields ดังนี้:
@@ -104,7 +108,7 @@ def get_product_data(action, query_params=None):
         # - "fetch_expensive_items": ดึงสินค้าที่มีราคาสูง
         
         app_logger.debug(f"Action '{action}' not recognized or missing query_params.")
-        return None # ถ้าไม่ตรงกับ action ที่รู้จัก
+        return None
     
     except Exception as e:
         app_logger.error(f"Firestore data retrieval error: {e}")
@@ -115,18 +119,16 @@ def get_product_data(action, query_params=None):
 def callback():
     signature = request.headers['X-Line-Signature']
     body = request.get_data(as_text=True)
-    app_logger.info("Request body: " + body) # Debug: ควรจะเห็น Request body ใน Logs
+    app_logger.info("Request body: " + body)
 
     try:
-        # !!! จุดที่สำคัญที่สุด: handler.handle ควรจะเรียก handler.add ที่คุณเห็นด้านล่าง !!!
         handler.handle(body, signature)
     except InvalidSignatureError:
-        app_logger.error("Invalid signature. Check your channel secret.") # Debug: ถ้ามีปัญหา signature จะเห็น Error นี้
-        abort(400) # Bad Request
-    except Exception as e: # !!! เพิ่มจุดนี้เพื่อจับ Exception ที่ handler.handle อาจจะไม่ได้จัดการ !!!
+        app_logger.error("Invalid signature. Check your channel secret.")
+        abort(400)
+    except Exception as e:
         app_logger.exception(f"FATAL ERROR: Unhandled exception in handler.handle during LINE webhook processing: {e}")
-        # ใช้ app_logger.exception เพื่อให้ได้ full traceback ใน logs
-        abort(500) # Internal Server Error
+        abort(500)
     return 'OK'
 
 # --- Event Handler สำหรับ Text Message ---
@@ -135,44 +137,50 @@ def handle_message(event):
     user_message = event.message.text
     reply_message = "ขออภัยค่ะ ไม่เข้าใจคำถามของคุณ ลองถามใหม่นะคะ"
 
-    app_logger.debug(f"\n--- New Message from LINE ---") # Debug: บรรทัดแรกที่คุณควรเห็น
-    app_logger.debug(f"User message received: '{user_message}'") # Debug: ควรเห็นข้อความผู้ใช้
+    app_logger.debug(f"\n--- New Message from LINE ---")
+    app_logger.debug(f"User message received: '{user_message}'")
     start_total_time = time.time()
 
     try:
-        # --- ขั้นตอนที่ 1: ให้ Gemini ระบุ "เจตนา" และข้อมูลที่ต้องการจากคำถามผู้ใช้ ---
-        start_gemini_intent_time = time.time()
-        intent_prompt = f"""
-        คุณคือผู้ช่วย AI ที่เชี่ยวชาญในการทำความเข้าใจคำถามและระบุข้อมูลที่จำเป็นจากฐานข้อมูลสินค้า.
-        ฐานข้อมูลของเรามี Collection 'products' ที่มีโครงสร้างดังนี้:
-        {FIRESTORE_SCHEMA_DESCRIPTION}
-
-        จากคำถามของผู้ใช้ โปรดระบุ "action" ที่เหมาะสมที่สุดเพื่อดึงข้อมูลจากฐานข้อมูล.
-        และระบุ "query_params" ที่จำเป็นสำหรับ action นั้นๆ.
+        # --- ขั้นตอนที่ 1: ให้ OpenAI GPT ระบุ "เจตนา" และข้อมูลที่ต้องการจากคำถามผู้ใช้ ---
+        start_openai_intent_time = time.time()
         
-        รูปแบบการตอบกลับต้องเป็น JSON เท่านั้น. ห้ามมีข้อความอื่นใดๆ เพิ่มเติม.
+        # Prompt สำหรับ OpenAI GPT
+        # เราใช้ ChatCompletion API ของ OpenAI
+        messages_for_intent = [
+            {"role": "system", "content": f"""
+            คุณคือผู้ช่วย AI ที่เชี่ยวชาญในการทำความเข้าใจคำถามและระบุข้อมูลที่จำเป็นจากฐานข้อมูลสินค้า.
+            ฐานข้อมูลของเรามี Collection 'products' ที่มีโครงสร้างดังนี้:
+            {FIRESTORE_SCHEMA_DESCRIPTION}
 
-        Possible actions:
-        - "fetch_all_products": เมื่อผู้ใช้ต้องการข้อมูลสินค้าทั้งหมด (ไม่มี query_params)
-        - "fetch_by_name": เมื่อผู้ใช้ถามถึงข้อมูลเฉพาะของสินค้าด้วยชื่อ (query_params: {{"name": "ชื่อสินค้า"}})
-        - "fetch_by_category": เมื่อผู้ใช้ถามถึงสินค้าในหมวดหมู่ใดหมวดหมู่หนึ่ง (query_params: {{"category": "ชื่อหมวดหมู่"}})
-        - "unknown": เมื่อไม่สามารถระบุ action ได้ (ไม่มี query_params)
+            จากคำถามของผู้ใช้ โปรดระบุ "action" ที่เหมาะสมที่สุดเพื่อดึงข้อมูลจากฐานข้อมูล.
+            และระบุ "query_params" ที่จำเป็นสำหรับ action นั้นๆ.
+            
+            รูปแบบการตอบกลับต้องเป็น JSON เท่านั้น. ห้ามมีข้อความอื่นใดๆ เพิ่มเติม.
 
-        ตัวอย่างการตอบกลับ:
-        - สำหรับ "มีสินค้าอะไรบ้าง": {{"action": "fetch_all_products"}}
-        - สำหรับ "ราคา iPhone 15 เท่าไหร่": {{"action": "fetch_by_name", "query_params": {{"name": "iPhone 15"}}}}
-        - สำหรับ "สินค้าหมวด Laptops มีอะไรบ้าง": {{"action": "fetch_by_category", "query_params": {{"category": "Laptops"}}}}
-        - สำหรับ "สวัสดี": {{"action": "unknown"}}
+            Possible actions:
+            - "fetch_all_products": เมื่อผู้ใช้ต้องการข้อมูลสินค้าทั้งหมด (ไม่มี query_params)
+            - "fetch_by_name": เมื่อผู้ใช้ถามถึงข้อมูลเฉพาะของสินค้าด้วยชื่อ (query_params: {{"name": "ชื่อสินค้า"}})
+            - "fetch_by_category": เมื่อผู้ใช้ถามถึงสินค้าในหมวดหมู่ใดหมวดหมู่หนึ่ง (query_params: {{"category": "ชื่อหมวดหมู่"}})
+            - "unknown": เมื่อไม่สามารถระบุ action ได้ (ไม่มี query_params)
 
-        คำถามจากผู้ใช้: "{user_message}"
+            ตัวอย่างการตอบกลับ:
+            - สำหรับ "มีสินค้าอะไรบ้าง": {{"action": "fetch_all_products"}}
+            - สำหรับ "ราคา iPhone 15 เท่าไหร่": {{"action": "fetch_by_name", "query_params": {{"name": "iPhone 15"}}}}
+            - สำหรับ "สินค้าหมวด Laptops มีอะไรบ้าง": {{"action": "fetch_by_category", "query_params": {{"category": "Laptops"}}}}
+            - สำหรับ "สวัสดี": {{"action": "unknown"}}
+            """},
+            {"role": "user", "content": user_message}
+        ]
 
-        JSON Response:
-        """
-        
-        intent_response = model.generate_content(intent_prompt)
-        intent_json_str = intent_response.text.strip()
-        app_logger.debug(f"Time for Intent generation: {time.time() - start_gemini_intent_time:.2f} seconds")
-        app_logger.debug(f"Gemini Intent JSON: {intent_json_str}")
+        intent_response_openai = client.chat.completions.create(
+            model="gpt-3.5-turbo", # สามารถลองใช้ "gpt-4o" หรือรุ่นอื่นที่คุณมีสิทธิ์เข้าถึง
+            messages=messages_for_intent,
+            response_format={"type": "json_object"} # สำคัญมากเพื่อให้ GPT ตอบกลับมาเป็น JSON
+        )
+        intent_json_str = intent_response_openai.choices[0].message.content.strip()
+        app_logger.debug(f"Time for OpenAI Intent generation: {time.time() - start_openai_intent_time:.2f} seconds")
+        app_logger.debug(f"OpenAI Intent JSON: {intent_json_str}")
 
         action = "unknown"
         query_params = None
@@ -182,7 +190,7 @@ def handle_message(event):
             query_params = intent_data.get('query_params')
             app_logger.debug(f"Parsed action: '{action}', params: '{query_params}'")
         except json.JSONDecodeError:
-            app_logger.error(f"Failed to parse JSON from Gemini: {intent_json_str}")
+            app_logger.error(f"Failed to parse JSON from OpenAI: {intent_json_str}")
             # action ยังคงเป็น "unknown" ตามค่าเริ่มต้น
 
         retrieved_data = None
@@ -192,41 +200,49 @@ def handle_message(event):
                 reply_message = retrieved_data
                 app_logger.error(f"Firestore data retrieval failed: {reply_message}")
                 line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_message))
-                return # จบการทำงานตรงนี้ถ้ามี error ในการดึงข้อมูล
+                return
             app_logger.debug(f"Retrieved data from Firestore: {json.dumps(retrieved_data, ensure_ascii=False)}")
         else:
             app_logger.debug(f"Action is 'unknown', skipping data retrieval.")
 
-        # --- ขั้นตอนที่ 2: ให้ Gemini สังเคราะห์คำตอบจากข้อมูลที่ดึงมา ---
-        start_gemini_answer_time = time.time()
-        answer_prompt = f"""
-        ผู้ใช้ถามคำถาม: "{user_message}"
-
-        นี่คือข้อมูลที่เรามีจากฐานข้อมูลสินค้า (Firebase Firestore):
-        {json.dumps(retrieved_data, indent=2, ensure_ascii=False) if retrieved_data else "ไม่พบข้อมูลที่เกี่ยวข้อง"}
-
-        โปรดตอบคำถามของผู้ใช้ด้วยภาษาที่เป็นธรรมชาติและเป็นประโยชน์ โดยอ้างอิงจากข้อมูลที่ให้มา.
-        ถ้าข้อมูลที่ให้มาไม่เพียงพอที่จะตอบคำถามได้ ให้ตอบกลับอย่างสุภาพว่าไม่พบข้อมูลที่เกี่ยวข้อง.
-        หลีกเลี่ยงการตอบว่า "ไม่สามารถดำเนินการ" หรือ "ไม่พบข้อมูลที่ตรงกับคำถามของคุณค่ะ" หากคุณสามารถสรุปจากข้อมูลที่มีได้.
+        # --- ขั้นตอนที่ 2: ให้ OpenAI GPT สังเคราะห์คำตอบจากข้อมูลที่ดึงมา ---
+        start_openai_answer_time = time.time()
         
-        ตัวอย่างการตอบ:
-        - ถ้าถามราคา iPhone 15 และมีข้อมูล: "iPhone 15 มีราคา 35,000 บาทค่ะ"
-        - ถ้าถามสินค้าหมวด Laptops และมีข้อมูล: "สินค้าในหมวด Laptops ได้แก่ MacBook Air M3 (ราคา 45,000 บาท) และ Dell XPS 15 (ราคา 55,000 บาท) ค่ะ"
-        - ถ้าถามเรื่องสต็อก: "สินค้า iPhone 15 มีสต็อก 100 ชิ้นค่ะ"
-        - ถ้าถามสิ่งที่ข้อมูลไม่มี: "ขออภัยค่ะ ไม่พบข้อมูลเกี่ยวกับเรื่องนั้นในฐานข้อมูลของเราในขณะนี้"
+        messages_for_answer = [
+            {"role": "system", "content": f"""
+            คุณคือผู้ช่วย AI ที่เป็นมิตรและเป็นประโยชน์.
+            ผู้ใช้ถามคำถาม: "{user_message}"
+            นี่คือข้อมูลที่เรามีจากฐานข้อมูลสินค้า (Firebase Firestore):
+            {json.dumps(retrieved_data, indent=2, ensure_ascii=False) if retrieved_data else "ไม่พบข้อมูลที่เกี่ยวข้อง"}
 
-        คำตอบ:
-        """
-        
-        final_answer_response = model.generate_content(answer_prompt)
-        reply_message = final_answer_response.text.strip()
-        app_logger.debug(f"Time for Answer generation: {time.time() - start_gemini_answer_time:.2f} seconds")
+            โปรดตอบคำถามของผู้ใช้ด้วยภาษาที่เป็นธรรมชาติและเป็นประโยชน์อย่างยิ่ง โดยอ้างอิงจากข้อมูลที่ให้มาเท่านั้น.
+            หากข้อมูลที่ให้มาไม่เพียงพอที่จะตอบคำถามได้ตรงๆ ให้ตอบกลับอย่างสุภาพและบอกว่าเรามีข้อมูลอะไรบ้างที่เกี่ยวข้องแทน.
+            ห้ามสร้างข้อมูลเอง.
+            
+            ตัวอย่างการตอบ:
+            - ถ้าถามราคา iPhone 15 และมีข้อมูล: "iPhone 15 มีราคา 35,000 บาทค่ะ"
+            - ถ้าถามสินค้าหมวด Laptops และมีข้อมูล: "สินค้าในหมวด Laptops ได้แก่ MacBook Air M3 (ราคา 45,000 บาท) และ Dell XPS 15 (ราคา 55,000 บาท) ค่ะ"
+            - ถ้าถามเรื่องสต็อก: "สินค้า iPhone 15 มีสต็อก 100 ชิ้นค่ะ"
+            - ถ้าถามสิ่งที่ข้อมูลไม่มี: "ขออภัยค่ะ ไม่พบข้อมูลเกี่ยวกับเรื่องนั้นในฐานข้อมูลของเราในขณะนี้"
+            """},
+            {"role": "user", "content": user_message}
+        ]
+
+        final_answer_openai = client.chat.completions.create(
+            model="gpt-3.5-turbo", # สามารถลองใช้ "gpt-4o" หรือรุ่นอื่นที่คุณมีสิทธิ์เข้าถึง
+            messages=messages_for_answer
+        )
+        reply_message = final_answer_openai.choices[0].message.content.strip()
+        app_logger.debug(f"Time for OpenAI Answer generation: {time.time() - start_openai_answer_time:.2f} seconds")
         app_logger.debug(f"Final reply message to LINE: '{reply_message}'")
 
         if not reply_message: # ถ้าข้อความเป็นค่าว่าง
             reply_message = "ขออภัยค่ะ ไม่สามารถสร้างคำตอบได้ในขณะนี้ โปรดลองอีกครั้ง."
             app_logger.warning("Reply message was empty, setting fallback.")
 
+    except openai.APIError as e: # Catch errors specific to OpenAI API
+        app_logger.error(f"OpenAI API Error: {e}")
+        reply_message = "เกิดข้อผิดพลาดในการเชื่อมต่อกับ AI กรุณาลองใหม่อีกครั้งค่ะ"
     except Exception as e:
         app_logger.exception(f"FATAL ERROR: Unhandled exception in handle_message: {e}")
         reply_message = "เกิดข้อผิดพลาดในการประมวลผล กรุณาลองใหม่อีกครั้งค่ะ"
